@@ -25,6 +25,7 @@
 /*
  * Copyright (c) 2014 by Delphix. All rights reserved.
  * Copyright 2018 Joyent, Inc.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #ifndef	_VM_HTABLE_H
@@ -205,6 +206,7 @@ extern htable_t *htable_getpte(struct hat *, uintptr_t, uint_t *, x86pte_t *,
  * page mapping is present.
  */
 extern htable_t *htable_getpage(struct hat *hat, uintptr_t va, uint_t *entry);
+extern int htable_demote_kpm(uintptr_t va);
 
 /*
  * Called to allocate initial/additional htables for reserve.

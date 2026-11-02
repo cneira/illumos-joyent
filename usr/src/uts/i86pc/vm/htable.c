@@ -23,6 +23,7 @@
  * Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2014 by Delphix. All rights reserved.
  * Copyright 2018 Joyent, Inc.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <sys/types.h>
@@ -54,6 +55,7 @@
 #include <vm/hat_i86.h>
 #include <sys/cmn_err.h>
 #include <sys/panic.h>
+#include <sys/errno.h>
 
 #ifdef __xpv
 #include <sys/hypervisor.h>
@@ -125,6 +127,10 @@ uint32_t htable_dont_cache = 0;
  * Track the number of active pagetables, so we can know how many to reap
  */
 static uint32_t active_ptables = 0;
+
+/* Inspect with mdb to confirm that the CUDA allocation reached this path. */
+volatile uint64_t hat_kpm_demote_1g;
+volatile uint64_t hat_kpm_demote_2m;
 
 #ifdef __xpv
 /*
@@ -1820,6 +1826,101 @@ htable_getpage(struct hat *hat, uintptr_t vaddr, uint_t *entry)
 		return (ht);
 	htable_release(ht);
 	return (NULL);
+}
+
+/*
+ * Split one existing large KPM leaf without removing its mapping.  The
+ * prepared child is private until the parent CAS succeeds; the child hash
+ * lock keeps concurrent lookups from seeing the new parent PTP before its
+ * htable is visible.  Only boot-created NOCONSIST KPM mappings are eligible;
+ * later locked mappings have a separate lock-count lifecycle.
+ */
+int
+htable_demote_kpm(uintptr_t va)
+{
+#ifdef __xpv
+	(void) va;
+	return (ENOTSUP);
+#else
+	hat_t *hat = kas.a_hat;
+	htable_t *parent, *child, *existing;
+	x86pte_t old, found, bits, pte;
+	pfn_t base;
+	uintptr_t child_base;
+	uint_t entry, hash, i;
+	level_t level;
+	int error = 0;
+
+	parent = htable_getpage(hat, va, &entry);
+	if (parent == NULL)
+		return (ENOENT);
+	level = parent->ht_level;
+	if (level == 0) {
+		htable_release(parent);
+		return (0);
+	}
+	if (level > 2 || !mmu.pae_hat) {
+		htable_release(parent);
+		return (ENOTSUP);
+	}
+	old = x86pte_get(parent, entry);
+	if (!PTE_IS_LGPG(old, level) || !(old & PT_NOCONSIST) ||
+	    parent->ht_lock_cnt != 0) {
+		htable_release(parent);
+		return (EBUSY);
+	}
+	child_base = va & LEVEL_MASK(level);
+	child = htable_alloc(hat, child_base, level - 1, NULL);
+	base = PTE2PFN(old, level);
+	bits = old & ~(PT_PADDR_LGPG | PT_PAGESIZE | PT_PAT_LARGE);
+	if (level == 1 && (old & PT_PAT_LARGE))
+		bits |= PT_PAT_4K;
+	if (level > 1)
+		bits |= PT_PAGESIZE | (old & PT_PAT_LARGE);
+	for (i = 0; i < HTABLE_NUM_PTES(child); i++) {
+		pte = bits | pfn_to_pa(base +
+		    i * mmu_btop(LEVEL_SIZE(level - 1)));
+		(void) x86pte_set(child, i, pte, NULL);
+	}
+	child->ht_valid_cnt = HTABLE_NUM_PTES(child);
+	hash = HTABLE_HASH(hat, child_base, level - 1);
+	HTABLE_ENTER(hash);
+	for (existing = hat->hat_ht_hash[hash]; existing != NULL;
+	    existing = existing->ht_next) {
+		if (existing->ht_hat == hat &&
+		    existing->ht_vaddr == child_base &&
+		    existing->ht_level == level - 1)
+			break;
+	}
+	if (existing != NULL) {
+		error = EAGAIN;
+	} else {
+		found = x86pte_update(parent, entry, old,
+		    MAKEPTP(child->ht_pfn, child->ht_level));
+		if (found != old) {
+			error = EAGAIN;
+		} else {
+			child->ht_parent = parent;
+			child->ht_next = hat->hat_ht_hash[hash];
+			if (child->ht_next != NULL)
+				child->ht_next->ht_prev = child;
+			hat->hat_ht_hash[hash] = child;
+			if (level == 2)
+				atomic_inc_64(&hat_kpm_demote_1g);
+			else
+				atomic_inc_64(&hat_kpm_demote_2m);
+		}
+	}
+	HTABLE_EXIT(hash);
+	if (error != 0) {
+		x86pte_zero(child, 0, HTABLE_NUM_PTES(child));
+		htable_free(child);
+		htable_release(parent);
+		return (error);
+	}
+	htable_release(child);
+	return (0);
+#endif
 }
 
 

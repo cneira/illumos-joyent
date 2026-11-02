@@ -4816,12 +4816,52 @@ hat_kpm_pfn2va(pfn_t pfn)
 }
 
 /*
+ * Ensure that a driver-owned PFN has a 4 KiB KPM leaf before a cache-policy
+ * transition.  Large KPM leaves are split in place; unrelated PFNs retain
+ * their original cache attributes.  The split does not change cache policy.
+ */
+int
+hat_kpm_prepare_cache(pfn_t pfn)
+{
+#ifdef __xpv
+	(void) pfn;
+	return (ENOTSUP);
+#else
+	caddr_t va;
+	htable_t *ht;
+	uint_t entry;
+	x86pte_t pte;
+	int error, tries;
+
+	if (!kpm_enable || kpm_vbase == NULL || pfn_is_foreign(pfn))
+		return (ENOTSUP);
+	va = hat_kpm_pfn2va(pfn);
+	for (tries = 0; tries < 8; tries++) {
+		ht = htable_getpage(kas.a_hat, (uintptr_t)va, &entry);
+		if (ht == NULL)
+			return (ENOENT);
+		if (ht->ht_level == 0) {
+			pte = x86pte_get(ht, entry);
+			htable_release(ht);
+			return (PTE_ISVALID(pte) && PTE2PFN(pte, 0) == pfn ?
+			    0 : EBUSY);
+		}
+		htable_release(ht);
+		error = htable_demote_kpm((uintptr_t)va);
+		if (error != 0 && error != EAGAIN)
+			return (error);
+	}
+	return (EBUSY);
+#endif
+}
+
+/*
  * Change only the cache policy of an existing 4K KPM mapping.  Rebuilding
  * the PTE through hat_devload() also changes unrelated bits (in particular
  * PT_GLOBAL with KPTI enabled), and may panic after installing that PTE.
  * The caller must quiesce users of the page and flush CPU caches before and
- * after the transition.  Large KPM mappings require page-table demotion and
- * are deliberately rejected here.
+ * after the transition.  Call hat_kpm_prepare_cache() first to split a
+ * large KPM mapping; this operation still accepts only a 4 KiB leaf.
  */
 int
 hat_kpm_set_cache(pfn_t pfn, uint_t expected, uint_t desired)

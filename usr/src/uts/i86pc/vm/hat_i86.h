@@ -253,6 +253,7 @@ extern void hat_pte_unmap(htable_t *ht, uint_t entry, uint_t flags,
 extern void hat_init_finish(void);
 extern caddr_t hat_kpm_pfn2va(pfn_t pfn);
 extern int hat_kpm_set_cache(pfn_t, uint_t expected, uint_t desired);
+extern int hat_kpm_prepare_cache(pfn_t);
 extern pfn_t hat_kpm_va2pfn(caddr_t);
 extern page_t *hat_kpm_vaddr2page(caddr_t);
 extern uintptr_t hat_kernelbase(uintptr_t);
