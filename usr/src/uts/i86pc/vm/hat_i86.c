@@ -31,6 +31,7 @@
  * Copyright (c) 2014, 2015 by Delphix. All rights reserved.
  * Copyright 2022 Tintri by DDN, Inc. All rights reserved.
  * Copyright 2026 Oxide Computer Company
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 /*
@@ -272,6 +273,7 @@
 #include <vm/seg_spt.h>
 
 #include <sys/cmn_err.h>
+#include <sys/errno.h>
 
 /*
  * Basic parameters for hat operation.
@@ -4811,6 +4813,70 @@ hat_kpm_pfn2va(pfn_t pfn)
 
 	ASSERT(!pfn_is_foreign(pfn));
 	return ((caddr_t)vaddr);
+}
+
+/*
+ * Change only the cache policy of an existing 4K KPM mapping.  Rebuilding
+ * the PTE through hat_devload() also changes unrelated bits (in particular
+ * PT_GLOBAL with KPTI enabled), and may panic after installing that PTE.
+ * The caller must quiesce users of the page and flush CPU caches before and
+ * after the transition.  Large KPM mappings require page-table demotion and
+ * are deliberately rejected here.
+ */
+int
+hat_kpm_set_cache(pfn_t pfn, uint_t expected, uint_t desired)
+{
+#ifdef __xpv
+	(void) pfn;
+	(void) expected;
+	(void) desired;
+	return (ENOTSUP);
+#else
+	htable_t *ht;
+	caddr_t va;
+	x86pte_t old, new, found;
+	x86pte_t mask = PT_WRITETHRU | PT_NOCACHE | PT_PAT_4K;
+	x86pte_t from, to;
+	uint_t entry;
+	int error = 0;
+
+	if ((expected != HAT_STORECACHING_OK &&
+	    expected != HAT_MERGING_OK) ||
+	    (desired != HAT_STORECACHING_OK && desired != HAT_MERGING_OK))
+		return (EINVAL);
+	if (!kpm_enable || kpm_vbase == NULL || pfn_is_foreign(pfn))
+		return (ENOTSUP);
+
+	from = hati_mkpte(pfn, PROT_READ | PROT_WRITE | expected, 0,
+	    HAT_LOAD_NOCONSIST) & mask;
+	to = hati_mkpte(pfn, PROT_READ | PROT_WRITE | desired, 0,
+	    HAT_LOAD_NOCONSIST) & mask;
+	va = hat_kpm_pfn2va(pfn);
+	ht = htable_getpte(kas.a_hat, (uintptr_t)va, &entry, &old, 0);
+	if (ht == NULL)
+		return (hat_getpagesize(kas.a_hat, va) > MMU_PAGESIZE ?
+		    ENOTSUP : ENOENT);
+
+	for (;;) {
+		if (!PTE_ISVALID(old)) {
+			error = ENOENT;
+			break;
+		}
+		if (PTE2PFN(old, 0) != pfn || (old & mask) != from) {
+			error = EBUSY;
+			break;
+		}
+		if (from == to)
+			break;
+		new = (old & ~mask) | to;
+		found = x86pte_update(ht, entry, old, new);
+		if (found == old)
+			break;
+		old = found;
+	}
+	htable_release(ht);
+	return (error);
+#endif
 }
 
 /*
