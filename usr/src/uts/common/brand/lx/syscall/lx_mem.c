@@ -416,6 +416,34 @@ lx_mmap_common(void *addr, size_t len, int prot, int flags, int fd, off64_t off)
 	}
 
 	ret = smmap64(addr, len, prot, lx_ltos_mmap_flags(flags), fd, off);
+	/*
+	 * A MAP_32BIT mmap can leave a_lastgap below 2 GiB.  The native
+	 * top-down search may then use that hint as its upper bound for a
+	 * later, unrestricted mapping and report ENOMEM with ample free VA
+	 * above it.  Retry this Linux anonymous case without the stale hint.
+	 * Keep the native mmap implementation and all other LX cases intact.
+	 */
+	if (ttolwp(curthread)->lwp_errno == ENOMEM && addr == NULL &&
+	    curproc->p_model == DATAMODEL_LP64 &&
+	    flags == (MAP_PRIVATE | LX_MAP_ANONYMOUS | LX_MAP_NORESERVE)) {
+		struct as *as = curproc->p_as;
+		boolean_t retry = B_FALSE;
+
+		AS_LOCK_ENTER(as, RW_WRITER);
+		if (as->a_lastgap != NULL &&
+		    (uintptr_t)as->a_lastgap->s_base < (1UL << 31)) {
+			as->a_lastgap = NULL;
+			retry = B_TRUE;
+		}
+		AS_LOCK_EXIT(as);
+
+		if (retry) {
+			/* smmap64() does not clear errno after a successful call. */
+			ttolwp(curthread)->lwp_errno = 0;
+			ret = smmap64(addr, len, prot,
+			    lx_ltos_mmap_flags(flags), fd, off);
+		}
+	}
 	if (ttolwp(curthread)->lwp_errno != 0) {
 		if (ttolwp(curthread)->lwp_errno == EOVERFLOW)
 			(void) set_errno(ENOMEM);
