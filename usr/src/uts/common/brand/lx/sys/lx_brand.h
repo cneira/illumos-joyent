@@ -457,6 +457,7 @@ typedef struct lx_ptrace_accord {
 	kmutex_t		lxpa_lock;
 	uint_t			lxpa_refcnt;
 	lx_accord_flags_t	lxpa_flags;
+	pid_t			lxpa_tracer_pid; /* immutable Linux PID of tracer LWP */
 
 	/*
 	 * The tracer must hold "pidlock" while clearing these fields for

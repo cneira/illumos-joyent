@@ -2728,7 +2728,7 @@ lxpr_read_status_common(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf,
 	const gid_t	*groups;
 	struct as	*as;
 	char		*status;
-	pid_t		pid, ppid;
+	pid_t		pid, ppid, tracerpid = 0;
 	pid_t		tid = (lookup_id == 0) ? lxpnp->lxpr_pid : lookup_id;
 	k_sigset_t	current, ignore, handle;
 	int		i, lx_sig, lwpcnt, ngroups;
@@ -2746,6 +2746,18 @@ lxpr_read_status_common(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf,
 
 	/* Translate the pid (e.g. initpid to 1) */
 	lxpr_fixpid(LXPTOZ(lxpnp), p, &pid, &ppid);
+
+	/*
+	 * The tracee's accord pointer is protected by p_lock.  Its cached Linux
+	 * tracer PID is immutable, so we need not acquire pidlock to inspect the
+	 * tracer LWP while holding the tracee's p_lock.
+	 */
+	if (t != NULL && p->p_brand == &lx_brand) {
+		lx_lwp_data_t *lwpd = ttolxlwp(t);
+
+		if (lwpd != NULL && lwpd->br_ptrace_tracer != NULL)
+			tracerpid = lwpd->br_ptrace_tracer->lxpa_tracer_pid;
+	}
 
 	if (t != NULL) {
 		thread_lock(t);
@@ -2848,7 +2860,7 @@ lxpr_read_status_common(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf,
 	    pid, /* thread group id - same as pid */
 	    (lookup_id == 0) ? pid : lxpnp->lxpr_desc,
 	    ppid,
-	    0,
+	    tracerpid,
 	    crgetruid(cr), crgetuid(cr), crgetsuid(cr), crgetuid(cr),
 	    crgetrgid(cr), crgetgid(cr), crgetsgid(cr), crgetgid(cr),
 	    fdlim);
