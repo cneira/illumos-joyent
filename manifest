@@ -5256,6 +5256,7 @@ f usr/kernel/drv/amd64/ksyms 0755 root sys
 f usr/kernel/drv/amd64/logindmux 0755 root sys
 f usr/kernel/drv/amd64/lx_ptm 0755 root sys
 f usr/kernel/drv/amd64/lx_systrace 0755 root sys
+f usr/kernel/drv/amd64/lx_uinput 0755 root sys
 f usr/kernel/drv/amd64/lxautofs 0755 root sys
 f usr/kernel/drv/amd64/nsmb 0755 root sys
 f usr/kernel/drv/amd64/pm 0755 root sys
@@ -5284,6 +5285,7 @@ f usr/kernel/drv/ksyms.conf 0644 root sys
 f usr/kernel/drv/logindmux.conf 0644 root sys
 f usr/kernel/drv/lx_ptm.conf 0644 root sys
 f usr/kernel/drv/lx_systrace.conf 0644 root sys
+f usr/kernel/drv/lx_uinput.conf 0644 root sys
 f usr/kernel/drv/lxautofs.conf 0644 root sys
 f usr/kernel/drv/nsmb.conf 0644 root sys
 f usr/kernel/drv/pm.conf 0644 root sys
