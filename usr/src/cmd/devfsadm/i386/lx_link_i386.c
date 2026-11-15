@@ -34,6 +34,7 @@
 static int lx_ptm(di_minor_t minor, di_node_t node);
 static int lx_autofs(di_minor_t minor, di_node_t node);
 static int lx_systrace(di_minor_t minor, di_node_t node);
+static int lx_uinput(di_minor_t minor, di_node_t node);
 
 static devfsadm_create_t lx_create_cbt[] = {
 	{ "pseudo", "ddi_pseudo", LX_PTM_DRV,
@@ -42,6 +43,8 @@ static devfsadm_create_t lx_create_cbt[] = {
 	    TYPE_EXACT | DRV_EXACT, ILEVEL_0, lx_autofs },
 	{ "pseudo", "ddi_pseudo", "lx_systrace",
 	    TYPE_EXACT | DRV_EXACT, ILEVEL_0, lx_systrace },
+	{ "pseudo", "ddi_pseudo", "lx_uinput",
+	    TYPE_EXACT | DRV_EXACT, ILEVEL_0, lx_uinput },
 };
 
 DEVFSADM_CREATE_INIT_V0(lx_create_cbt);
@@ -76,6 +79,19 @@ lx_systrace(di_minor_t minor, di_node_t node)
 
 	(void) snprintf(path, sizeof (path), "dtrace/provider/%s", mname);
 	(void) devfsadm_mklink(path, node, minor, 0);
+
+	return (DEVFSADM_CONTINUE);
+}
+
+static int
+lx_uinput(di_minor_t minor, di_node_t node)
+{
+	char *name = di_minor_name(minor);
+
+	if (strcmp(name, "uinput") == 0)
+		(void) devfsadm_mklink("uinput", node, minor, 0);
+	else if (strcmp(name, "event0") == 0)
+		(void) devfsadm_mklink("input/event0", node, minor, 0);
 
 	return (DEVFSADM_CONTINUE);
 }

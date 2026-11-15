@@ -61,6 +61,7 @@ dir path=usr/lib/devfsadm/linkmod group=sys
 driver name=lx_audio
 driver name=lx_ptm perms="lx_ptmajor 0666 root sys"
 driver name=lx_systrace perms="* 0644 root sys"
+driver name=lx_uinput perms="* 0666 root sys"
 file path=etc/zones/SUNWlx.xml mode=0444
 file path=etc/zones/SUNWlx26.xml mode=0444
 file path=usr/kernel/brand/$(ARCH64)/lx_brand group=sys mode=0755
@@ -68,12 +69,14 @@ file path=usr/kernel/brand/lx_brand group=sys mode=0755
 file path=usr/kernel/drv/$(ARCH64)/lx_audio group=sys
 file path=usr/kernel/drv/$(ARCH64)/lx_ptm group=sys
 file path=usr/kernel/drv/$(ARCH64)/lx_systrace group=sys
+file path=usr/kernel/drv/$(ARCH64)/lx_uinput group=sys
 file path=usr/kernel/drv/lx_audio group=sys
 file path=usr/kernel/drv/lx_audio.conf group=sys
 file path=usr/kernel/drv/lx_ptm group=sys
 file path=usr/kernel/drv/lx_ptm.conf group=sys
 file path=usr/kernel/drv/lx_systrace group=sys
 file path=usr/kernel/drv/lx_systrace.conf group=sys
+file path=usr/kernel/drv/lx_uinput.conf group=sys
 file path=usr/kernel/fs/$(ARCH64)/lx_afs group=sys mode=0755
 file path=usr/kernel/fs/$(ARCH64)/lx_proc group=sys mode=0755
 file path=usr/kernel/fs/lx_afs group=sys mode=0755

@@ -1856,7 +1856,8 @@ lx_ioctl(int fdes, int cmd, intptr_t arg)
 	    (cmd > 0 && cmd <= 4095) ||
 	    cmd == 0x30000001 || cmd == 0x30000002);
 	if (nvidia_cmd && fp->f_vnode->v_type == VCHR &&
-	    (driver = ddi_major_to_name(getmajor(fp->f_vnode->v_rdev))) != NULL &&
+	    (driver = ddi_major_to_name(
+	    getmajor(fp->f_vnode->v_rdev))) != NULL &&
 	    (strcmp(driver, "nvidia") == 0 ||
 	    strcmp(driver, "nvidia_modeset") == 0 ||
 	    strcmp(driver, "nvidia_uvm") == 0)) {
@@ -1864,6 +1865,23 @@ lx_ioctl(int fdes, int cmd, intptr_t arg)
 		    &rval, NULL);
 		releasef(fdes);
 		return (error != 0 ? set_errno(error) : rval);
+	}
+
+	/*
+	 * The LX virtual gamepad driver consumes Linux uinput and evdev ioctl
+	 * encodings directly.  Restrict this path to its character devices so
+	 * unrelated descriptors retain Linux's ENOTTY behavior.
+	 */
+	if (fp->f_vnode->v_type == VCHR &&
+	    ((((uint32_t)cmd >> 8) & 0xff) == 'U' ||
+	    (((uint32_t)cmd >> 8) & 0xff) == 'E')) {
+		driver = ddi_major_to_name(getmajor(fp->f_vnode->v_rdev));
+		if (driver != NULL && strcmp(driver, "lx_uinput") == 0) {
+			error = VOP_IOCTL(fp->f_vnode, cmd, arg, FLUSER(fp),
+			    CRED(), &rval, NULL);
+			releasef(fdes);
+			return (error != 0 ? set_errno(error) : rval);
+		}
 	}
 
 	switch ((cmd & 0xff00) >> 8) {
