@@ -35,6 +35,7 @@
 #define	LUI_CLONE_BASE 2
 #define	LUI_READER_BASE 65536
 #define	LUI_RING 256
+#define	LUI_MAX_READERS 64
 #define	LUI_EV_MAX 31
 #define	LUI_KEY_MAX 767
 #define	LUI_ABS_MAX 63
@@ -101,6 +102,8 @@ typedef struct lui_reader {
 	zoneid_t zone;
 	minor_t minor;
 	uint_t head, tail, count;
+	uint_t active;
+	boolean_t closing;
 	struct pollhead pollhead;
 	lui_event_t events[LUI_RING];
 } lui_reader_t;
@@ -143,6 +146,45 @@ lui_free(lui_state_t *s)
 	cv_destroy(&s->cv);
 	mutex_destroy(&s->lock);
 	kmem_free(s, sizeof (*s));
+}
+
+/*
+ * pollwakeup() can acquire a pollcache lock held by a thread in lui_poll().
+ * Never call it while holding either driver lock.  Keep each reader alive
+ * across the unlocked wakeup; close defers its free while active is nonzero.
+ */
+static uint_t
+lui_collect_wakers(lui_state_t *s, lui_reader_t **wakers)
+{
+	lui_reader_t *reader;
+	uint_t n = 0;
+
+	ASSERT(MUTEX_HELD(&s->lock));
+	for (reader = s->reader_head; reader != NULL;
+	    reader = reader->state_next) {
+		ASSERT(n < LUI_MAX_READERS);
+		reader->active++;
+		wakers[n++] = reader;
+	}
+	return (n);
+}
+
+static void
+lui_wake_readers(lui_state_t *s, lui_reader_t **wakers, uint_t n,
+    short events)
+{
+	uint_t i;
+
+	for (i = 0; i < n; i++)
+		pollwakeup(&wakers[i]->pollhead, events);
+	mutex_enter(&s->lock);
+	for (i = 0; i < n; i++) {
+		ASSERT(wakers[i]->active != 0);
+		wakers[i]->active--;
+		if (wakers[i]->closing && wakers[i]->active == 0)
+			kmem_free(wakers[i], sizeof (*wakers[i]));
+	}
+	mutex_exit(&s->lock);
 }
 
 /* A single producer is allowed per zone; its cloned minor is zone derived. */
@@ -188,6 +230,8 @@ lui_open(dev_t *devp, int flags, int otyp, cred_t *cr)
 			mutex_enter(&s->lock);
 			if (!s->created)
 				error = ENODEV;
+			else if (s->readers >= LUI_MAX_READERS)
+				error = EMFILE;
 			else if ((new_reader->minor =
 			    id_allocff_nosleep(lui_reader_ids)) == (minor_t)-1)
 				error = ENOSPC;
@@ -224,8 +268,10 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 {
 	lui_state_t *s;
 	lui_reader_t *reader = NULL;
+	lui_reader_t *wakers[LUI_MAX_READERS];
 	lui_reader_t **rp;
 	lui_reader_t **srp;
+	uint_t nwake = 0;
 	minor_t minor = getminor(dev);
 	(void) flags;
 	(void) otyp;
@@ -248,14 +294,17 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 			ASSERT(*srp != NULL);
 		*srp = reader->state_next;
 		id_free(lui_reader_ids, reader->minor);
+		if (reader->active != 0) {
+			reader->closing = B_TRUE;
+			reader = NULL;
+		}
 	} else if (minor == LUI_CLONE_BASE + s->zone) {
 		s->producer = B_FALSE;
 		s->created = B_FALSE;
 		cv_broadcast(&s->cv);
-		for (reader = s->reader_head; reader != NULL;
-		    reader = reader->state_next)
-			pollwakeup(&reader->pollhead, POLLHUP);
-		reader = NULL;
+		nwake = lui_collect_wakers(s, wakers);
+		if (nwake != 0)
+			s->active++;
 	}
 	mutex_exit(&s->lock);
 	if (!s->producer && s->readers == 0 && s->active == 0)
@@ -263,6 +312,15 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 	mutex_exit(&lui_list_lock);
 	if (reader != NULL)
 		kmem_free(reader, sizeof (*reader));
+	if (nwake != 0) {
+		lui_wake_readers(s, wakers, nwake, POLLHUP);
+		mutex_enter(&lui_list_lock);
+		ASSERT(s->active != 0);
+		s->active--;
+		if (!s->producer && s->readers == 0 && s->active == 0)
+			lui_free(s);
+		mutex_exit(&lui_list_lock);
+	}
 	return (0);
 }
 
@@ -332,6 +390,8 @@ lui_write(dev_t dev, struct uio *uio, cred_t *cr)
 	lui_reader_t *reader;
 	lui_event_t event;
 	lui_event32_t event32;
+	lui_reader_t *wakers[LUI_MAX_READERS];
+	uint_t nwake;
 	boolean_t compat = get_udatamodel() != DATAMODEL_NATIVE;
 	size_t event_size = compat ? sizeof (event32) : sizeof (event);
 	struct timespec ts;
@@ -406,10 +466,11 @@ lui_write(dev_t dev, struct uio *uio, cred_t *cr)
 			reader->events[reader->head] = event;
 			reader->head = (reader->head + 1) % LUI_RING;
 			reader->count++;
-			pollwakeup(&reader->pollhead, POLLIN | POLLRDNORM);
 		}
+		nwake = lui_collect_wakers(s, wakers);
 		cv_broadcast(&s->cv);
 		mutex_exit(&s->lock);
+		lui_wake_readers(s, wakers, nwake, POLLIN | POLLRDNORM);
 	}
 	mutex_enter(&lui_list_lock);
 	ASSERT(s->active != 0);
@@ -442,6 +503,8 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 	boolean_t variable_result = B_FALSE;
 	lui_abs_setup_t abs_setup;
 	lui_setup_t setup;
+	lui_reader_t *wakers[LUI_MAX_READERS];
+	uint_t nwake = 0;
 	int error = 0;
 	*rv = 0;
 	if (!is_event && getminor(dev) >= LUI_CLONE_BASE &&
@@ -471,6 +534,7 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 		return (ENOTTY);
 	}
 	mutex_enter(&s->lock);
+	s->active++;
 	mutex_exit(&lui_list_lock);
 	if (is_event) {
 		if (LUI_IOC_TYPE(cmd) != 'E') {
@@ -577,8 +641,8 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 		for (reader = s->reader_head; reader != NULL;
 		    reader = reader->state_next) {
 			reader->head = reader->tail = reader->count = 0;
-			pollwakeup(&reader->pollhead, POLLHUP);
 		}
+		nwake = lui_collect_wakers(s, wakers);
 		break;
 	case 0x03: /* UI_DEV_SETUP */
 		if (s->created)
@@ -616,6 +680,14 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 	}
 out:
 	mutex_exit(&s->lock);
+	if (nwake != 0)
+		lui_wake_readers(s, wakers, nwake, POLLHUP);
+	mutex_enter(&lui_list_lock);
+	ASSERT(s->active != 0);
+	s->active--;
+	if (!s->producer && s->readers == 0 && s->active == 0)
+		lui_free(s);
+	mutex_exit(&lui_list_lock);
 	if (error == 0 && output_len != 0)
 		error = lui_copyout(output, output_len, arg, mode);
 	if (error == 0 && variable_result)
