@@ -169,11 +169,28 @@ lui_collect_wakers(lui_state_t *s, lui_reader_t **wakers)
 	return (n);
 }
 
+/*
+ * The pollhead is embedded in the reader, so every polldat still linked on
+ * it must be detached before the memory is freed.  Otherwise a later
+ * pollwakeup() on a recycled reader walks a stale ph_list into a freed
+ * pollcache.  Like pollwakeup(), this takes poll locks: no driver lock may
+ * be held.
+ */
+static void
+lui_reader_free(lui_reader_t *reader)
+{
+	if (reader->pollhead.ph_list != NULL) {
+		pollwakeup(&reader->pollhead, POLLERR);
+		pollhead_clean(&reader->pollhead);
+	}
+	kmem_free(reader, sizeof (*reader));
+}
+
 static void
 lui_wake_readers(lui_state_t *s, lui_reader_t **wakers, uint_t n,
     short events)
 {
-	uint_t i;
+	uint_t i, ndead = 0;
 
 	for (i = 0; i < n; i++)
 		pollwakeup(&wakers[i]->pollhead, events);
@@ -181,10 +198,13 @@ lui_wake_readers(lui_state_t *s, lui_reader_t **wakers, uint_t n,
 	for (i = 0; i < n; i++) {
 		ASSERT(wakers[i]->active != 0);
 		wakers[i]->active--;
+		/* Compact in place; ndead <= i. */
 		if (wakers[i]->closing && wakers[i]->active == 0)
-			kmem_free(wakers[i], sizeof (*wakers[i]));
+			wakers[ndead++] = wakers[i];
 	}
 	mutex_exit(&s->lock);
+	for (i = 0; i < ndead; i++)
+		lui_reader_free(wakers[i]);
 }
 
 /* A single producer is allowed per zone; its cloned minor is zone derived. */
@@ -311,7 +331,7 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 		lui_free(s);
 	mutex_exit(&lui_list_lock);
 	if (reader != NULL)
-		kmem_free(reader, sizeof (*reader));
+		lui_reader_free(reader);
 	if (nwake != 0) {
 		lui_wake_readers(s, wakers, nwake, POLLHUP);
 		mutex_enter(&lui_list_lock);
