@@ -29,6 +29,8 @@
 #include <sys/stat.h>
 #include <sys/id_space.h>
 #include <sys/model.h>
+#include <sys/vnode.h>
+#include <sys/pathname.h>
 
 #define	LUI_PRODUCER 0
 #define	LUI_EVENT 1
@@ -507,6 +509,36 @@ lui_copyout(const void *src, size_t n, intptr_t arg, int mode)
 	return (ddi_copyout(src, (void *)arg, n, mode) == 0 ? 0 : EFAULT);
 }
 
+/*
+ * Linux creates a new evdev node for each device.  Steam/SDL and Wine with
+ * udev disabled watch /dev/input with inotify and only probe a node when an
+ * event names it; some SDL builds poll the directory mtime instead.  Our
+ * event0 node is permanent, so mimic creation in the caller's /dev: bump the
+ * directory mtime, and do a non-exclusive VOP_CREATE of event0, which sdev
+ * resolves to the existing node and inotify reports as IN_CREATE "event0"
+ * (exactly what touch(1) does).  Best effort.
+ */
+static void
+lui_announce_event0(void)
+{
+	vnode_t *dvp, *vp;
+	vattr_t va;
+
+	if (lookupname("/dev/input", UIO_SYSSPACE, FOLLOW, NULLVPP, &dvp) != 0)
+		return;
+	va.va_mask = AT_MTIME;
+	gethrestime(&va.va_mtime);
+	(void) VOP_SETATTR(dvp, &va, 0, kcred, NULL);
+	bzero(&va, sizeof (va));
+	va.va_mask = AT_TYPE | AT_MODE;
+	va.va_type = VCHR;
+	va.va_mode = 0666;
+	if (VOP_CREATE(dvp, "event0", &va, NONEXCL, VREAD, &vp, kcred, 0,
+	    NULL, NULL) == 0)
+		VN_RELE(vp);
+	VN_RELE(dvp);
+}
+
 static int
 lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 {
@@ -525,6 +557,7 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 	lui_setup_t setup;
 	lui_reader_t *wakers[LUI_MAX_READERS];
 	uint_t nwake = 0;
+	boolean_t created = B_FALSE;
 	int error = 0;
 	*rv = 0;
 	if (!is_event && getminor(dev) >= LUI_CLONE_BASE &&
@@ -652,7 +685,7 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 		    (s->abs[0] & 1) == 0)
 			error = EOPNOTSUPP;
 		else
-			s->created = B_TRUE;
+			s->created = created = B_TRUE;
 		break;
 	case 0x02: /* UI_DEV_DESTROY */
 		s->created = B_FALSE;
@@ -708,6 +741,8 @@ out:
 	if (!s->producer && s->readers == 0 && s->active == 0)
 		lui_free(s);
 	mutex_exit(&lui_list_lock);
+	if (created)
+		lui_announce_event0();
 	if (error == 0 && output_len != 0)
 		error = lui_copyout(output, output_len, arg, mode);
 	if (error == 0 && variable_result)
