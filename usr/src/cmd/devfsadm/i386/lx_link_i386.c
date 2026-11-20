@@ -23,6 +23,7 @@
  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2016 Joyent, Inc.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <devfsadm.h>
@@ -87,11 +88,14 @@ static int
 lx_uinput(di_minor_t minor, di_node_t node)
 {
 	char *name = di_minor_name(minor);
+	char path[MAXPATHLEN];
 
 	if (strcmp(name, "uinput") == 0)
 		(void) devfsadm_mklink("uinput", node, minor, 0);
-	else if (strcmp(name, "event0") == 0)
-		(void) devfsadm_mklink("input/event0", node, minor, 0);
+	else if (strncmp(name, "event", 5) == 0) {
+		(void) snprintf(path, sizeof (path), "input/%s", name);
+		(void) devfsadm_mklink(path, node, minor, 0);
+	}
 
 	return (DEVFSADM_CONTINUE);
 }

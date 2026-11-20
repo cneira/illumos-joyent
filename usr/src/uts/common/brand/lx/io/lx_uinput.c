@@ -3,7 +3,7 @@
  * Common Development and Distribution License (CDDL), version 1.0.
  * A full copy of the CDDL should have accompanied this source.
  *
- * Copyright 2026 Carlos Neira.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 /*
@@ -33,8 +33,9 @@
 #include <sys/pathname.h>
 
 #define	LUI_PRODUCER 0
-#define	LUI_EVENT 1
-#define	LUI_CLONE_BASE 2
+#define	LUI_EVENT_BASE 1
+#define	LUI_MAX_DEVICES 4
+#define	LUI_CLONE_BASE (LUI_EVENT_BASE + LUI_MAX_DEVICES)
 #define	LUI_READER_BASE 65536
 #define	LUI_RING 256
 #define	LUI_MAX_READERS 64
@@ -84,6 +85,8 @@ typedef struct lui_state {
 	struct lui_state *next;
 	struct lui_reader *reader_head;
 	zoneid_t zone;
+	minor_t producer_minor;
+	uint_t event_index;
 	boolean_t producer, created;
 	uint_t readers, active;
 	kmutex_t lock;
@@ -114,14 +117,27 @@ static dev_info_t *lui_dip;
 static kmutex_t lui_list_lock;
 static lui_state_t *lui_states;
 static lui_reader_t *lui_readers;
+static id_space_t *lui_producer_ids;
 static id_space_t *lui_reader_ids;
 
 static lui_state_t *
-lui_find(zoneid_t zid)
+lui_find_event(zoneid_t zid, uint_t index)
 {
 	lui_state_t *s;
 	for (s = lui_states; s != NULL; s = s->next) {
-		if (s->zone == zid)
+		if (s->zone == zid && s->event_index == index)
+			return (s);
+	}
+	return (NULL);
+}
+
+static lui_state_t *
+lui_find_producer(zoneid_t zid, minor_t minor)
+{
+	lui_state_t *s;
+	for (s = lui_states; s != NULL; s = s->next) {
+		if (s->zone == zid && s->producer_minor == minor &&
+		    s->producer)
 			return (s);
 	}
 	return (NULL);
@@ -145,6 +161,7 @@ lui_free(lui_state_t *s)
 	for (sp = &lui_states; *sp != s; sp = &(*sp)->next)
 		ASSERT(*sp != NULL);
 	*sp = s->next;
+	id_free(lui_producer_ids, s->producer_minor);
 	cv_destroy(&s->cv);
 	mutex_destroy(&s->lock);
 	kmem_free(s, sizeof (*s));
@@ -209,7 +226,7 @@ lui_wake_readers(lui_state_t *s, lui_reader_t **wakers, uint_t n,
 		lui_reader_free(wakers[i]);
 }
 
-/* A single producer is allowed per zone; its cloned minor is zone derived. */
+/* Each producer gets a distinct clone minor and event slot in its zone. */
 static int
 lui_open(dev_t *devp, int flags, int otyp, cred_t *cr)
 {
@@ -218,6 +235,7 @@ lui_open(dev_t *devp, int flags, int otyp, cred_t *cr)
 	lui_reader_t *new_reader = NULL;
 	minor_t minor = getminor(*devp);
 	zoneid_t zid = crgetzoneid(cr);
+	uint_t index;
 	int error = 0;
 	(void) flags;
 	if (otyp != OTYP_CHR)
@@ -229,23 +247,30 @@ lui_open(dev_t *devp, int flags, int otyp, cred_t *cr)
 		new_state->ev[0] = 1; /* EV_SYN is implicit in Linux uinput. */
 		mutex_init(&new_state->lock, NULL, MUTEX_DEFAULT, NULL);
 		cv_init(&new_state->cv, NULL, CV_DEFAULT, NULL);
-	} else if (minor == LUI_EVENT) {
+	} else if (minor >= LUI_EVENT_BASE && minor < LUI_CLONE_BASE) {
 		new_reader = kmem_zalloc(sizeof (*new_reader), KM_SLEEP);
 	}
 	mutex_enter(&lui_list_lock);
 	if (minor == LUI_PRODUCER) {
-		if (zid > LUI_READER_BASE - LUI_CLONE_BASE - 1 ||
-		    lui_find(zid) != NULL) {
-			error = EBUSY;
-		} else {
+		for (index = 0; index < LUI_MAX_DEVICES; index++) {
+			if (lui_find_event(zid, index) == NULL)
+				break;
+		}
+		if (index == LUI_MAX_DEVICES)
+			error = ENOSPC;
+		else if ((new_state->producer_minor =
+		    id_allocff_nosleep(lui_producer_ids)) == (minor_t)-1)
+			error = ENOSPC;
+		else {
+			new_state->event_index = index;
 			new_state->next = lui_states;
 			lui_states = new_state;
-			new_state = NULL;
 			*devp = makedevice(getmajor(*devp),
-			    LUI_CLONE_BASE + zid);
+			    new_state->producer_minor);
+			new_state = NULL;
 		}
-	} else if (minor == LUI_EVENT) {
-		s = lui_find(zid);
+	} else if (minor >= LUI_EVENT_BASE && minor < LUI_CLONE_BASE) {
+		s = lui_find_event(zid, minor - LUI_EVENT_BASE);
 		if (s == NULL)
 			error = ENODEV;
 		else {
@@ -298,14 +323,18 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 	(void) flags;
 	(void) otyp;
 	mutex_enter(&lui_list_lock);
-	s = lui_find(crgetzoneid(cr));
+	if (minor >= LUI_READER_BASE) {
+		reader = lui_find_reader(minor, crgetzoneid(cr));
+		s = reader != NULL ? reader->state : NULL;
+	} else {
+		s = lui_find_producer(crgetzoneid(cr), minor);
+	}
 	if (s == NULL) {
 		mutex_exit(&lui_list_lock);
 		return (ENODEV);
 	}
 	mutex_enter(&s->lock);
-	if (minor >= LUI_READER_BASE &&
-	    (reader = lui_find_reader(minor, s->zone)) != NULL) {
+	if (reader != NULL) {
 		ASSERT(s->readers != 0);
 		s->readers--;
 		for (rp = &lui_readers; *rp != reader; rp = &(*rp)->next)
@@ -320,7 +349,7 @@ lui_close(dev_t dev, int flags, int otyp, cred_t *cr)
 			reader->closing = B_TRUE;
 			reader = NULL;
 		}
-	} else if (minor == LUI_CLONE_BASE + s->zone) {
+	} else if (minor == s->producer_minor) {
 		s->producer = B_FALSE;
 		s->created = B_FALSE;
 		cv_broadcast(&s->cv);
@@ -422,8 +451,8 @@ lui_write(dev_t dev, struct uio *uio, cred_t *cr)
 	    uio->uio_resid % event_size != 0)
 		return (EINVAL);
 	mutex_enter(&lui_list_lock);
-	s = lui_find(crgetzoneid(cr));
-	if (s == NULL || getminor(dev) != LUI_CLONE_BASE + s->zone) {
+	s = lui_find_producer(crgetzoneid(cr), getminor(dev));
+	if (s == NULL) {
 		mutex_exit(&lui_list_lock);
 		return (ENODEV);
 	}
@@ -513,16 +542,18 @@ lui_copyout(const void *src, size_t n, intptr_t arg, int mode)
  * Linux creates a new evdev node for each device.  Steam/SDL and Wine with
  * udev disabled watch /dev/input with inotify and only probe a node when an
  * event names it; some SDL builds poll the directory mtime instead.  Our
- * event0 node is permanent, so mimic creation in the caller's /dev: bump the
- * directory mtime, and do a non-exclusive VOP_CREATE of event0, which sdev
- * resolves to the existing node and inotify reports as IN_CREATE "event0"
+ * event nodes are permanent, so mimic creation in the caller's /dev: bump the
+ * directory mtime, and do a non-exclusive VOP_CREATE of the selected event
+ * node, which sdev resolves to the existing node and inotify reports as
+ * IN_CREATE "eventN"
  * (exactly what touch(1) does).  Best effort.
  */
 static void
-lui_announce_event0(void)
+lui_announce_event(uint_t index)
 {
 	vnode_t *dvp, *vp;
 	vattr_t va;
+	char name[16];
 
 	if (lookupname("/dev/input", UIO_SYSSPACE, FOLLOW, NULLVPP, &dvp) != 0)
 		return;
@@ -533,7 +564,8 @@ lui_announce_event0(void)
 	va.va_mask = AT_TYPE | AT_MODE;
 	va.va_type = VCHR;
 	va.va_mode = 0666;
-	if (VOP_CREATE(dvp, "event0", &va, NONEXCL, VREAD, &vp, kcred, 0,
+	(void) snprintf(name, sizeof (name), "event%u", index);
+	if (VOP_CREATE(dvp, name, &va, NONEXCL, VREAD, &vp, kcred, 0,
 	    NULL, NULL) == 0)
 		VN_RELE(vp);
 	VN_RELE(dvp);
@@ -558,6 +590,7 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 	lui_reader_t *wakers[LUI_MAX_READERS];
 	uint_t nwake = 0;
 	boolean_t created = B_FALSE;
+	uint_t created_index = 0;
 	int error = 0;
 	*rv = 0;
 	if (!is_event && getminor(dev) >= LUI_CLONE_BASE &&
@@ -580,9 +613,8 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 	reader = is_event ? lui_find_reader(getminor(dev),
 	    crgetzoneid(cr)) : NULL;
 	s = is_event ? (reader != NULL ? reader->state : NULL) :
-	    lui_find(crgetzoneid(cr));
-	if (s == NULL || (!is_event &&
-	    getminor(dev) != LUI_CLONE_BASE + s->zone)) {
+	    lui_find_producer(crgetzoneid(cr), getminor(dev));
+	if (s == NULL) {
 		mutex_exit(&lui_list_lock);
 		return (ENOTTY);
 	}
@@ -684,8 +716,10 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 		    (1 << (LUI_BTN_SOUTH % 8))) == 0 ||
 		    (s->abs[0] & 1) == 0)
 			error = EOPNOTSUPP;
-		else
+		else {
 			s->created = created = B_TRUE;
+			created_index = s->event_index;
+		}
 		break;
 	case 0x02: /* UI_DEV_DESTROY */
 		s->created = B_FALSE;
@@ -713,8 +747,9 @@ lui_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr, int *rv)
 		if (size == 0)
 			error = EINVAL;
 		else {
-			output_len = MIN(size, 7);
-			bcopy("input0", output, output_len);
+			(void) snprintf((char *)output, sizeof (output),
+			    "input%u", s->event_index);
+			output_len = MIN(size, strlen((char *)output) + 1);
 			variable_result = B_TRUE;
 		}
 		break;
@@ -742,7 +777,7 @@ out:
 		lui_free(s);
 	mutex_exit(&lui_list_lock);
 	if (created)
-		lui_announce_event0();
+		lui_announce_event(created_index);
 	if (error == 0 && output_len != 0)
 		error = lui_copyout(output, output_len, arg, mode);
 	if (error == 0 && variable_result)
@@ -781,24 +816,40 @@ lui_poll(dev_t dev, short events, int anyyet, short *revents,
 static int
 lui_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
+	uint_t index;
+	char name[16];
 	if (cmd != DDI_ATTACH || lui_dip != NULL)
+		return (DDI_FAILURE);
+	lui_producer_ids = id_space_create("lx_uinput producers", LUI_CLONE_BASE,
+	    LUI_READER_BASE);
+	if (lui_producer_ids == NULL)
 		return (DDI_FAILURE);
 	lui_reader_ids = id_space_create("lx_uinput readers", LUI_READER_BASE,
 	    L_MAXMIN32 + 1);
-	if (lui_reader_ids == NULL)
+	if (lui_reader_ids == NULL) {
+		id_space_destroy(lui_producer_ids);
+		lui_producer_ids = NULL;
 		return (DDI_FAILURE);
+	}
 	if (ddi_create_minor_node(dip, "uinput", S_IFCHR,
 	    LUI_PRODUCER, DDI_PSEUDO, 0) != DDI_SUCCESS) {
 		id_space_destroy(lui_reader_ids);
 		lui_reader_ids = NULL;
+		id_space_destroy(lui_producer_ids);
+		lui_producer_ids = NULL;
 		return (DDI_FAILURE);
 	}
-	if (ddi_create_minor_node(dip, "event0", S_IFCHR,
-	    LUI_EVENT, DDI_PSEUDO, 0) != DDI_SUCCESS) {
-		ddi_remove_minor_node(dip, NULL);
-		id_space_destroy(lui_reader_ids);
-		lui_reader_ids = NULL;
-		return (DDI_FAILURE);
+	for (index = 0; index < LUI_MAX_DEVICES; index++) {
+		(void) snprintf(name, sizeof (name), "event%u", index);
+		if (ddi_create_minor_node(dip, name, S_IFCHR,
+		    LUI_EVENT_BASE + index, DDI_PSEUDO, 0) != DDI_SUCCESS) {
+			ddi_remove_minor_node(dip, NULL);
+			id_space_destroy(lui_reader_ids);
+			lui_reader_ids = NULL;
+			id_space_destroy(lui_producer_ids);
+			lui_producer_ids = NULL;
+			return (DDI_FAILURE);
+		}
 	}
 	lui_dip = dip;
 	ddi_report_dev(dip);
@@ -819,6 +870,8 @@ lui_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	ddi_remove_minor_node(dip, NULL);
 	id_space_destroy(lui_reader_ids);
 	lui_reader_ids = NULL;
+	id_space_destroy(lui_producer_ids);
+	lui_producer_ids = NULL;
 	lui_dip = NULL;
 	return (DDI_SUCCESS);
 }
